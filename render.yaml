@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: malagabus-backend
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python run.py
+    healthCheckPath: /v1/health

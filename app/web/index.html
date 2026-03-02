@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MalagaBus</title>
+  <style>
+    :root {
+      --bg: #0e1a2b;
+      --card: #13243a;
+      --primary: #2d7dd2;
+      --ok: #16a34a;
+      --txt: #e8eef7;
+      --muted: #9fb2ca;
+      --danger: #ef4444;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background: linear-gradient(180deg, #0b1422, #101f33);
+      color: var(--txt);
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 16px;
+    }
+    .app {
+      width: min(680px, 100%);
+      background: var(--card);
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 16px;
+      padding: 16px;
+      box-shadow: 0 14px 40px rgba(0,0,0,.28);
+    }
+    h1 { margin: 0 0 6px; font-size: 1.4rem; }
+    p { margin: 0 0 12px; color: var(--muted); }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    input, button {
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,.15);
+      padding: 10px 12px;
+      font-size: 15px;
+    }
+    input {
+      flex: 1 1 260px;
+      background: #0f1b2d;
+      color: var(--txt);
+    }
+    button {
+      background: var(--primary);
+      color: white;
+      cursor: pointer;
+      border: 0;
+    }
+    button[disabled] { opacity: .6; cursor: default; }
+    .status {
+      margin-top: 10px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .ok { color: #8fe7a4; }
+    .error { color: #ff9aa2; }
+    .card {
+      margin-top: 12px;
+      border: 1px solid rgba(255,255,255,.1);
+      border-radius: 12px;
+      padding: 12px;
+      background: rgba(255,255,255,.02);
+    }
+    .title {
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+    .step {
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(255,255,255,.04);
+      margin-bottom: 8px;
+      border: 1px solid rgba(255,255,255,.08);
+    }
+    .small { font-size: 13px; color: var(--muted); }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <h1>MalagaBus</h1>
+    <p>Escribe destino y te guiamos paso a paso.</p>
+    <div class="row">
+      <input id="destino" type="text" placeholder="Ej: Alameda Principal, Málaga" />
+      <button id="btnPlan">Llévame</button>
+    </div>
+    <div id="status" class="status">Comprobando servicio...</div>
+
+    <section id="resultado" class="card hidden">
+      <div class="title">Ruta recomendada</div>
+      <div id="resumen" class="small"></div>
+      <div id="pasos"></div>
+      <div class="row" style="margin-top:8px;">
+        <button id="btnIniciar">Iniciar guía</button>
+        <button id="btnSiguiente" disabled>Siguiente paso</button>
+      </div>
+      <div id="guia" class="status"></div>
+    </section>
+  </main>
+
+  <script>
+    const statusEl = document.getElementById("status");
+    const resultEl = document.getElementById("resultado");
+    const resumenEl = document.getElementById("resumen");
+    const pasosEl = document.getElementById("pasos");
+    const guiaEl = document.getElementById("guia");
+    const btnPlan = document.getElementById("btnPlan");
+    const btnIniciar = document.getElementById("btnIniciar");
+    const btnSiguiente = document.getElementById("btnSiguiente");
+    const destinoEl = document.getElementById("destino");
+
+    let selectedRouteId = null;
+    let journeyId = null;
+
+    function setStatus(msg, type = "") {
+      statusEl.textContent = msg;
+      statusEl.className = "status " + type;
+    }
+
+    async function checkHealth() {
+      try {
+        const r = await fetch("/v1/health");
+        if (!r.ok) throw new Error("backend_down");
+        const d = await r.json();
+        setStatus("Servicio listo. " + (d.gtfs_loaded ? "Datos cargados." : "Cargando datos..."), "ok");
+      } catch (_) {
+        setStatus("No se pudo conectar al servicio.", "error");
+      }
+    }
+
+    async function getOrigin() {
+      return await new Promise((resolve) => {
+        if (!navigator.geolocation) {
+          resolve({ lat: 36.7213, lon: -4.4214 });
+          return;
+        }
+        navigator.geolocation.getCurrentPosition(
+          (p) => resolve({ lat: p.coords.latitude, lon: p.coords.longitude }),
+          () => resolve({ lat: 36.7213, lon: -4.4214 }),
+          { timeout: 4000, enableHighAccuracy: true }
+        );
+      });
+    }
+
+    function renderSteps(steps) {
+      pasosEl.innerHTML = "";
+      for (const s of steps || []) {
+        const div = document.createElement("div");
+        div.className = "step";
+        div.textContent = `${s.order}. ${s.instruction}` + (s.eta_minutes ? ` (~${s.eta_minutes} min)` : "");
+        pasosEl.appendChild(div);
+      }
+    }
+
+    async function planRoute() {
+      const destinationText = destinoEl.value.trim();
+      if (!destinationText) {
+        setStatus("Escribe un destino primero.", "error");
+        return;
+      }
+      btnPlan.disabled = true;
+      setStatus("Calculando mejor ruta...");
+      try {
+        const origin = await getOrigin();
+        const r = await fetch("/v1/route/plan", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            origin_lat: origin.lat,
+            origin_lon: origin.lon,
+            destination_text: destinationText,
+            lang: "es",
+            preferences: { avoid_transfers: false, minimize_walking: true, simple_mode: true }
+          })
+        });
+        if (!r.ok) throw new Error("route_fail");
+        const data = await r.json();
+        const route = (data.route_options || [])[0];
+        if (!route) throw new Error("no_route");
+
+        selectedRouteId = route.route_id;
+        journeyId = null;
+        btnSiguiente.disabled = true;
+        guiaEl.textContent = "";
+        resumenEl.textContent = `Línea ${route.line} • ${route.origin_stop} → ${route.destination_stop} • ${route.total_minutes} min`;
+        renderSteps(route.steps);
+        resultEl.classList.remove("hidden");
+        setStatus("Ruta lista.", "ok");
+      } catch (_) {
+        setStatus("No se pudo calcular la ruta. Revisa conexión.", "error");
+      } finally {
+        btnPlan.disabled = false;
+      }
+    }
+
+    async function startJourney() {
+      if (!selectedRouteId) return;
+      btnIniciar.disabled = true;
+      guiaEl.textContent = "Iniciando guía...";
+      try {
+        const r = await fetch("/v1/journey/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ route_id: selectedRouteId, lang: "es" })
+        });
+        if (!r.ok) throw new Error("journey_start_fail");
+        const d = await r.json();
+        journeyId = d.journey_id;
+        btnSiguiente.disabled = false;
+        guiaEl.textContent = "Guía iniciada. Pulsa 'Siguiente paso'.";
+        guiaEl.className = "status ok";
+      } catch (_) {
+        guiaEl.textContent = "No se pudo iniciar la guía.";
+        guiaEl.className = "status error";
+      } finally {
+        btnIniciar.disabled = false;
+      }
+    }
+
+    async function nextStep() {
+      if (!journeyId) return;
+      try {
+        const r = await fetch(`/v1/journey/${journeyId}/next-step`);
+        if (!r.ok) throw new Error("journey_next_fail");
+        const d = await r.json();
+        const txt = d.instruction || d.message || "Paso recibido.";
+        guiaEl.textContent = txt;
+        guiaEl.className = "status ok";
+        if (d.step_type === "finish" || d.status === "completed") {
+          btnSiguiente.disabled = true;
+        }
+      } catch (_) {
+        guiaEl.textContent = "Error obteniendo siguiente paso.";
+        guiaEl.className = "status error";
+      }
+    }
+
+    btnPlan.addEventListener("click", planRoute);
+    btnIniciar.addEventListener("click", startJourney);
+    btnSiguiente.addEventListener("click", nextStep);
+    destinoEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") planRoute();
+    });
+
+    checkHealth();
+  </script>
+</body>
+</html>

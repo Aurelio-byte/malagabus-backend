@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Datos locales/cache de desarrollo
+app/data/*.json
+
+# Logs locales
+*.log
+logs/
