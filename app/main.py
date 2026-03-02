@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4
@@ -27,6 +28,7 @@ realtime_service = RealtimeService()
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
+IS_RENDER = os.environ.get("RENDER", "").lower() == "true"
 
 
 class Preferences(BaseModel):
@@ -81,6 +83,10 @@ def app_home():
 
 @app.on_event("startup")
 def startup_bootstrap():
+    # En Render Free (512MB), cargar GTFS completo al arranque puede tumbar el proceso por memoria.
+    # Lo evitamos en cloud y dejamos la carga bajo demanda mediante /v1/data/refresh.
+    if IS_RENDER:
+        return
     # Carga datos en arranque si no existe cache local.
     if not gtfs_service.stops:
         try:
