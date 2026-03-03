@@ -4,6 +4,12 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>MalagaBus</title>
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
   <style>
     :root {
       --bg: #0e1a2b;
@@ -81,6 +87,13 @@
     }
     .small { font-size: 13px; color: var(--muted); }
     .hidden { display: none; }
+    #routeMap {
+      width: 100%;
+      height: 260px;
+      border-radius: 10px;
+      margin-top: 10px;
+      border: 1px solid rgba(255,255,255,.1);
+    }
   </style>
 </head>
 <body>
@@ -97,6 +110,7 @@
       <div class="title">Ruta recomendada</div>
       <div id="resumen" class="small"></div>
       <div id="pasos"></div>
+      <div id="routeMap" class="hidden"></div>
       <div class="row" style="margin-top:8px;">
         <button id="btnIniciar">Iniciar guía</button>
         <button id="btnSiguiente" disabled>Siguiente paso</button>
@@ -105,12 +119,18 @@
     </section>
   </main>
 
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
   <script>
     const statusEl = document.getElementById("status");
     const resultEl = document.getElementById("resultado");
     const resumenEl = document.getElementById("resumen");
     const pasosEl = document.getElementById("pasos");
     const guiaEl = document.getElementById("guia");
+    const mapEl = document.getElementById("routeMap");
     const btnPlan = document.getElementById("btnPlan");
     const btnIniciar = document.getElementById("btnIniciar");
     const btnSiguiente = document.getElementById("btnSiguiente");
@@ -118,6 +138,7 @@
 
     let selectedRouteId = null;
     let journeyId = null;
+    let routeMap = null;
 
     function setStatus(msg, type = "") {
       statusEl.textContent = msg;
@@ -159,6 +180,35 @@
       }
     }
 
+    function renderWalkMap(route) {
+      const path = route && Array.isArray(route.walk_to_origin_path)
+        ? route.walk_to_origin_path
+        : [];
+      if (!path || path.length < 2 || typeof L === "undefined") {
+        mapEl.classList.add("hidden");
+        return;
+      }
+      mapEl.classList.remove("hidden");
+      if (!routeMap) {
+        routeMap = L.map("routeMap", { zoomControl: false });
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          maxZoom: 19,
+          attribution: "&copy; OpenStreetMap",
+        }).addTo(routeMap);
+      } else {
+        routeMap.eachLayer((layer) => {
+          if (layer instanceof L.Polyline || layer instanceof L.Marker) {
+            routeMap.removeLayer(layer);
+          }
+        });
+      }
+      const poly = L.polyline(path, { color: "#2d7dd2", weight: 5 }).addTo(routeMap);
+      L.marker(path[0]).addTo(routeMap).bindPopup("Tu ubicación");
+      L.marker(path[path.length - 1]).addTo(routeMap).bindPopup("Parada de subida");
+      routeMap.fitBounds(poly.getBounds(), { padding: [18, 18] });
+      setTimeout(() => routeMap.invalidateSize(), 120);
+    }
+
     async function planRoute() {
       const destinationText = destinoEl.value.trim();
       if (!destinationText) {
@@ -183,18 +233,29 @@
         if (!r.ok) throw new Error("route_fail");
         const data = await r.json();
         const route = (data.route_options || [])[0];
-        if (!route) throw new Error("no_route");
+        if (!route) {
+          resultEl.classList.remove("hidden");
+          resumenEl.textContent = "No encontramos una ruta clara para ese destino.";
+          pasosEl.innerHTML = "";
+          guiaEl.textContent = "Prueba con una parada, zona o punto más concreto (ej: Alameda Principal).";
+          guiaEl.className = "status";
+          setStatus("Sin ruta disponible para ese texto.", "error");
+          return;
+        }
 
         selectedRouteId = route.route_id;
         journeyId = null;
         btnSiguiente.disabled = true;
         guiaEl.textContent = "";
-        resumenEl.textContent = `Línea ${route.line} • ${route.origin_stop} → ${route.destination_stop} • ${route.total_minutes} min`;
+        const etaTxt = route.wait_eta_minutes ? ` • Bus en ~${route.wait_eta_minutes} min` : "";
+        resumenEl.textContent = `Línea ${route.line} • ${route.origin_stop} → ${route.destination_stop} • ${route.total_minutes} min${etaTxt}`;
         renderSteps(route.steps);
+        renderWalkMap(route);
         resultEl.classList.remove("hidden");
         setStatus("Ruta lista.", "ok");
       } catch (_) {
         setStatus("No se pudo calcular la ruta. Revisa conexión.", "error");
+        mapEl.classList.add("hidden");
       } finally {
         btnPlan.disabled = false;
       }

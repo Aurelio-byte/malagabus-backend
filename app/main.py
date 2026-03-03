@@ -1,4 +1,8 @@
 import os
+import json
+import threading
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4
@@ -29,6 +33,7 @@ BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 IS_RENDER = os.environ.get("RENDER", "").lower() == "true"
+_data_load_lock = threading.Lock()
 
 
 class Preferences(BaseModel):
@@ -60,6 +65,10 @@ class RouteOption(BaseModel):
     total_minutes: int
     confidence: str
     steps: List[RouteStep]
+    wait_eta_minutes: Optional[int] = None
+    walk_to_origin_distance_m: Optional[int] = None
+    walk_to_origin_duration_min: Optional[int] = None
+    walk_to_origin_path: Optional[List[List[float]]] = None
 
 
 class RoutePlanResponse(BaseModel):
@@ -98,6 +107,109 @@ def startup_bootstrap():
             realtime_service.refresh()
         except Exception:
             pass
+
+
+def _ensure_data_ready() -> None:
+    """
+    Garantiza que GTFS esté cargado antes de planificar.
+    En Render se carga bajo demanda para evitar picos de memoria en startup.
+    """
+    if gtfs_service.stops:
+        return
+    with _data_load_lock:
+        if gtfs_service.stops:
+            return
+        try:
+            gtfs_service.refresh()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"No se han podido cargar datos GTFS aún: {exc}",
+            )
+        if not gtfs_service.stops:
+            raise HTTPException(
+                status_code=503,
+                detail="GTFS vacío tras refresh. Intenta de nuevo en unos segundos.",
+            )
+        if not realtime_service.positions:
+            try:
+                realtime_service.refresh()
+            except Exception:
+                pass
+
+
+def _wait_eta_minutes(origin_stop_id: str, line: str) -> int:
+    """
+    ETA real/fallback para la parada de subida de una línea.
+    """
+    try:
+        eta = compute_eta(
+            stop_id=origin_stop_id,
+            route_id=str(line),
+            gtfs_service=gtfs_service,
+            realtime_service=realtime_service,
+            realtime_last_updated=realtime_service.last_updated,
+        )
+        v = int(eta.get("eta_minutes", 8))
+        return max(1, min(v, 60))
+    except Exception:
+        return 8
+
+
+def _fetch_walk_path(lat_from: float, lon_from: float, lat_to: float, lon_to: float) -> dict:
+    """
+    Ruta peatonal real (OSRM). Devuelve dict con path [ [lat,lon], ... ].
+    Si falla red/API, devuelve {} y mantenemos fallback local.
+    """
+    try:
+        coords = f"{lon_from},{lat_from};{lon_to},{lat_to}"
+        params = urllib.parse.urlencode({"overview": "full", "geometries": "geojson", "steps": "false"})
+        url = f"https://router.project-osrm.org/route/v1/foot/{coords}?{params}"
+        req = urllib.request.Request(url, headers={"User-Agent": "MalagaBus/1.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+        routes = payload.get("routes") or []
+        if not routes:
+            return {}
+        r0 = routes[0]
+        geom = (r0.get("geometry") or {}).get("coordinates") or []
+        # OSRM devuelve [lon,lat] -> convertir a [lat,lon]
+        path = [[float(c[1]), float(c[0])] for c in geom if isinstance(c, list) and len(c) >= 2]
+        if len(path) < 2:
+            return {}
+        return {
+            "path": path,
+            "distance_m": int(round(float(r0.get("distance") or 0))),
+            "duration_min": max(1, int(round(float(r0.get("duration") or 0) / 60.0))),
+        }
+    except Exception:
+        return {}
+
+
+def _enrich_walk_to_origin(option: RouteOption, origin_lat: float, origin_lon: float) -> RouteOption:
+    """
+    Añade path peatonal real y reescribe paso 1/2 con datos de ETA/recorrido.
+    """
+    stop = next((s for s in gtfs_service.stops if s.get("stop_name") == option.origin_stop), None)
+    if not stop:
+        return option
+    try:
+        stop_lat = float(stop.get("stop_lat"))
+        stop_lon = float(stop.get("stop_lon"))
+    except Exception:
+        return option
+
+    walk = _fetch_walk_path(origin_lat, origin_lon, stop_lat, stop_lon)
+    if walk:
+        option.walk_to_origin_path = walk.get("path")
+        option.walk_to_origin_distance_m = int(walk.get("distance_m", option.walk_to_origin_distance_m or 0))
+        option.walk_to_origin_duration_min = int(walk.get("duration_min", option.walk_to_origin_duration_min or 0))
+        for st in option.steps:
+            if st.order == 1 and st.step_type == "walk":
+                st.instruction = f"Camina por el recorrido marcado hasta {option.origin_stop}."
+                st.eta_minutes = option.walk_to_origin_duration_min
+                break
+    return option
 
 
 @app.get("/v1/health")
@@ -144,6 +256,7 @@ def refresh_data():
 
 @app.get("/v1/stop/nearby")
 def nearby_stops(lat: float, lon: float):
+    _ensure_data_ready()
     stops = gtfs_service.nearest_stops(lat=lat, lon=lon, limit=8)
     if not stops:
         # fallback suave para no romper frontend si aun no se refrescaron datos
@@ -156,12 +269,14 @@ def nearby_stops(lat: float, lon: float):
 
 @app.get("/v1/stop/search")
 def search_stops(q: str):
+    _ensure_data_ready()
     return {"query": q, "stops": gtfs_service.search_stops(q, limit=10)}
 
 
 @app.get("/v1/eta")
 def eta(stop_id: str, route_id: str):
     """ETA en minutos usando datos reales: realtime (posición de vehículos) + distancia a parada; fallback a horario."""
+    _ensure_data_ready()
     result = compute_eta(
         stop_id=stop_id,
         route_id=route_id,
@@ -194,6 +309,7 @@ def eta_nearby(route_id: str, lat: float, lon: float):
 
 @app.post("/v1/route/plan", response_model=RoutePlanResponse)
 def plan_route(payload: RoutePlanRequest):
+    _ensure_data_ready()
     if not payload.destination_text.strip():
         raise HTTPException(status_code=400, detail="destination_text es obligatorio")
 
@@ -209,7 +325,7 @@ def plan_route(payload: RoutePlanRequest):
             for t in trips:
                 walk_to_origin_min = max(1, round(o.get("distance_m", 200) / 80))
                 walk_after_min = 3
-                wait_min = 4
+                wait_min = _wait_eta_minutes(o["stop_id"], str(t["line"]))
                 total_minutes = walk_to_origin_min + wait_min + t["duration_minutes"] + walk_after_min
                 option = RouteOption(
                     route_id=t["trip_id"],
@@ -218,6 +334,9 @@ def plan_route(payload: RoutePlanRequest):
                     destination_stop=d["name"],
                     total_minutes=total_minutes,
                     confidence="media" if realtime_service.positions else "baja",
+                    wait_eta_minutes=wait_min,
+                    walk_to_origin_distance_m=int(o.get("distance_m", 200)),
+                    walk_to_origin_duration_min=walk_to_origin_min,
                     steps=[
                         RouteStep(
                             order=1,
@@ -228,7 +347,10 @@ def plan_route(payload: RoutePlanRequest):
                         RouteStep(
                             order=2,
                             step_type="wait",
-                            instruction=f"Espera la línea {t['line']} ({t['headsign'] or 'dirección principal'}).",
+                            instruction=(
+                                f"Espera la línea {t['line']} "
+                                f"({t['headsign'] or 'dirección principal'}). Llega aprox. en {wait_min} min."
+                            ),
                             eta_minutes=wait_min,
                         ),
                         RouteStep(
@@ -253,6 +375,7 @@ def plan_route(payload: RoutePlanRequest):
     if computed_options:
         computed_options.sort(key=lambda x: x.total_minutes)
         top = computed_options[:3]
+        top[0] = _enrich_walk_to_origin(top[0], payload.origin_lat, payload.origin_lon)
         return RoutePlanResponse(recommended_route_id=top[0].route_id, route_options=top)
 
     # Segundo intento: buscar destino por texto en paradas aguas abajo del origen.
@@ -265,7 +388,7 @@ def plan_route(payload: RoutePlanRequest):
         smart_options = []
         for t in suggested:
             walk_to_origin_min = max(1, round(o.get("distance_m", 200) / 80))
-            wait_min = 4
+            wait_min = _wait_eta_minutes(o["stop_id"], str(t["line"]))
             walk_after_min = 3
             total_minutes = walk_to_origin_min + wait_min + t["duration_minutes"] + walk_after_min
             smart_options.append(
@@ -276,6 +399,9 @@ def plan_route(payload: RoutePlanRequest):
                     destination_stop=t.get("destination_stop_name") or payload.destination_text,
                     total_minutes=total_minutes,
                     confidence="media" if realtime_service.positions else "baja",
+                    wait_eta_minutes=wait_min,
+                    walk_to_origin_distance_m=int(o.get("distance_m", 200)),
+                    walk_to_origin_duration_min=walk_to_origin_min,
                     steps=[
                         RouteStep(
                             order=1,
@@ -286,7 +412,10 @@ def plan_route(payload: RoutePlanRequest):
                         RouteStep(
                             order=2,
                             step_type="wait",
-                            instruction=f"Espera la línea {t['line']} ({t['headsign'] or 'dirección principal'}).",
+                            instruction=(
+                                f"Espera la línea {t['line']} "
+                                f"({t['headsign'] or 'dirección principal'}). Llega aprox. en {wait_min} min."
+                            ),
                             eta_minutes=wait_min,
                         ),
                         RouteStep(
@@ -310,6 +439,9 @@ def plan_route(payload: RoutePlanRequest):
             )
         if smart_options:
             smart_options.sort(key=lambda x: x.total_minutes)
+            smart_options[0] = _enrich_walk_to_origin(
+                smart_options[0], payload.origin_lat, payload.origin_lon
+            )
             return RoutePlanResponse(
                 recommended_route_id=smart_options[0].route_id,
                 route_options=smart_options[:3],
@@ -324,7 +456,7 @@ def plan_route(payload: RoutePlanRequest):
         real_options = []
         for t in basic:
             walk_to_origin_min = max(1, round(o.get("distance_m", 200) / 80))
-            wait_min = 4
+            wait_min = _wait_eta_minutes(o["stop_id"], str(t["line"]))
             walk_after_min = 4
             total_minutes = walk_to_origin_min + wait_min + t["duration_minutes"] + walk_after_min
             real_options.append(
@@ -335,6 +467,9 @@ def plan_route(payload: RoutePlanRequest):
                     destination_stop=t.get("destination_stop_name") or payload.destination_text,
                     total_minutes=total_minutes,
                     confidence="media" if realtime_service.positions else "baja",
+                    wait_eta_minutes=wait_min,
+                    walk_to_origin_distance_m=int(o.get("distance_m", 200)),
+                    walk_to_origin_duration_min=walk_to_origin_min,
                     steps=[
                         RouteStep(
                             order=1,
@@ -345,7 +480,10 @@ def plan_route(payload: RoutePlanRequest):
                         RouteStep(
                             order=2,
                             step_type="wait",
-                            instruction=f"Espera la línea {t['line']} ({t['headsign'] or 'dirección principal'}).",
+                            instruction=(
+                                f"Espera la línea {t['line']} "
+                                f"({t['headsign'] or 'dirección principal'}). Llega aprox. en {wait_min} min."
+                            ),
                             eta_minutes=wait_min,
                         ),
                         RouteStep(
@@ -369,28 +507,14 @@ def plan_route(payload: RoutePlanRequest):
             )
         if real_options:
             real_options.sort(key=lambda x: x.total_minutes)
+            real_options[0] = _enrich_walk_to_origin(real_options[0], payload.origin_lat, payload.origin_lon)
             return RoutePlanResponse(
                 recommended_route_id=real_options[0].route_id,
                 route_options=real_options[:3],
             )
 
-    # Fallback controlado si no hay coincidencias reales suficientes
-    origin_name = nearby_origin[0]["name"] if nearby_origin else "Parada cercana"
-    fallback = RouteOption(
-        route_id="fallback_route",
-        line="L3",
-        origin_stop=origin_name,
-        destination_stop=payload.destination_text,
-        total_minutes=24,
-        confidence="baja",
-        steps=[
-            RouteStep(order=1, step_type="walk", instruction=f"Camina a la parada {origin_name}.", eta_minutes=3),
-            RouteStep(order=2, step_type="wait", instruction="Espera el próximo bus disponible.", eta_minutes=5),
-            RouteStep(order=3, step_type="ride", instruction="Sigue la guía y te avisaremos cuándo bajar.", eta_minutes=13),
-            RouteStep(order=4, step_type="walk", instruction="Camina hasta el destino final.", eta_minutes=3),
-        ],
-    )
-    return RoutePlanResponse(recommended_route_id=fallback.route_id, route_options=[fallback])
+    # Sin fallback "inventado": devolver vacío para que UI lo comunique correctamente.
+    return RoutePlanResponse(recommended_route_id="", route_options=[])
 
 
 class JourneyStartRequest(BaseModel):
