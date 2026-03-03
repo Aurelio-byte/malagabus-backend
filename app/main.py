@@ -34,6 +34,7 @@ WEB_DIR = BASE_DIR / "web"
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 IS_RENDER = os.environ.get("RENDER", "").lower() == "true"
 _data_load_lock = threading.Lock()
+MAX_SERVICE_AREA_DISTANCE_M = int(os.environ.get("MALAGABUS_MAX_SERVICE_DISTANCE_M", "2500"))
 
 
 class Preferences(BaseModel):
@@ -314,6 +315,28 @@ def plan_route(payload: RoutePlanRequest):
         raise HTTPException(status_code=400, detail="destination_text es obligatorio")
 
     nearby_origin = gtfs_service.nearest_stops(payload.origin_lat, payload.origin_lon, limit=5)
+    if not nearby_origin:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "outside_service_area",
+                "message": "No hay paradas EMT cercanas para tu ubicación.",
+            },
+        )
+    nearest_distance_m = int(nearby_origin[0].get("distance_m", 999999))
+    if nearest_distance_m > MAX_SERVICE_AREA_DISTANCE_M:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "outside_service_area",
+                "message": (
+                    "Estás fuera del área EMT Málaga. "
+                    "Acércate a Málaga ciudad para calcular rutas de bus urbano."
+                ),
+                "nearest_stop_distance_m": nearest_distance_m,
+            },
+        )
+
     destination_matches = gtfs_service.search_stops(payload.destination_text, limit=8)
 
     computed_options = []
