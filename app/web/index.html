@@ -112,6 +112,7 @@
       <div id="pasos"></div>
       <div id="routeMap" class="hidden"></div>
       <div class="row" style="margin-top:8px;">
+        <button id="btnNav" class="hidden">Navegar a parada</button>
         <button id="btnIniciar">Iniciar guía</button>
         <button id="btnSiguiente" disabled>Siguiente paso</button>
       </div>
@@ -132,6 +133,7 @@
     const guiaEl = document.getElementById("guia");
     const mapEl = document.getElementById("routeMap");
     const btnPlan = document.getElementById("btnPlan");
+    const btnNav = document.getElementById("btnNav");
     const btnIniciar = document.getElementById("btnIniciar");
     const btnSiguiente = document.getElementById("btnSiguiente");
     const destinoEl = document.getElementById("destino");
@@ -139,6 +141,7 @@
     let selectedRouteId = null;
     let journeyId = null;
     let routeMap = null;
+    let navTarget = null;
 
     function setStatus(msg, type = "") {
       statusEl.textContent = msg;
@@ -209,6 +212,37 @@
       setTimeout(() => routeMap.invalidateSize(), 120);
     }
 
+    function setNavTarget(route, origin) {
+      navTarget = null;
+      const lat = Number(route && route.origin_stop_lat);
+      const lon = Number(route && route.origin_stop_lon);
+      if (Number.isFinite(lat) && Number.isFinite(lon) && lat !== 0 && lon !== 0) {
+        navTarget = { lat, lon };
+      } else if (route && Array.isArray(route.walk_to_origin_path) && route.walk_to_origin_path.length >= 2) {
+        const p = route.walk_to_origin_path[route.walk_to_origin_path.length - 1];
+        if (Array.isArray(p) && p.length >= 2) {
+          navTarget = { lat: Number(p[0]), lon: Number(p[1]) };
+        }
+      }
+      if (navTarget) {
+        btnNav.classList.remove("hidden");
+        btnNav.disabled = false;
+      } else {
+        btnNav.classList.add("hidden");
+      }
+    }
+
+    function openExternalNavigation(origin) {
+      if (!navTarget) return;
+      const hasOrigin = origin && Number.isFinite(origin.lat) && Number.isFinite(origin.lon);
+      const base = "https://www.google.com/maps/dir/?api=1";
+      const from = hasOrigin ? `&origin=${origin.lat},${origin.lon}` : "";
+      const to = `&destination=${navTarget.lat},${navTarget.lon}`;
+      const mode = "&travelmode=walking";
+      const url = `${base}${from}${to}${mode}`;
+      window.open(url, "_blank");
+    }
+
     async function planRoute() {
       const destinationText = destinoEl.value.trim();
       if (!destinationText) {
@@ -256,12 +290,14 @@
         resumenEl.textContent = `Línea ${route.line} • ${route.origin_stop} → ${route.destination_stop} • ${route.total_minutes} min${etaTxt}`;
         renderSteps(route.steps);
         renderWalkMap(route);
+        setNavTarget(route, origin);
         resultEl.classList.remove("hidden");
         setStatus("Ruta lista.", "ok");
       } catch (e) {
         const msg = (e && e.message) ? e.message : "No se pudo calcular la ruta. Revisa conexión.";
         setStatus(msg, "error");
         mapEl.classList.add("hidden");
+        btnNav.classList.add("hidden");
       } finally {
         btnPlan.disabled = false;
       }
@@ -310,6 +346,10 @@
     }
 
     btnPlan.addEventListener("click", planRoute);
+    btnNav.addEventListener("click", async () => {
+      const origin = await getOrigin();
+      openExternalNavigation(origin);
+    });
     btnIniciar.addEventListener("click", startJourney);
     btnSiguiente.addEventListener("click", nextStep);
     destinoEl.addEventListener("keydown", (e) => {

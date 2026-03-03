@@ -62,6 +62,8 @@ class RouteOption(BaseModel):
     route_id: str
     line: str
     origin_stop: str
+    origin_stop_lat: Optional[float] = None
+    origin_stop_lon: Optional[float] = None
     destination_stop: str
     total_minutes: int
     confidence: str
@@ -354,6 +356,8 @@ def plan_route(payload: RoutePlanRequest):
                     route_id=t["trip_id"],
                     line=str(t["line"]),
                     origin_stop=o["name"],
+                    origin_stop_lat=float(o.get("lat", 0.0)),
+                    origin_stop_lon=float(o.get("lon", 0.0)),
                     destination_stop=d["name"],
                     total_minutes=total_minutes,
                     confidence="media" if realtime_service.positions else "baja",
@@ -419,6 +423,8 @@ def plan_route(payload: RoutePlanRequest):
                     route_id=t["trip_id"],
                     line=str(t["line"]),
                     origin_stop=o["name"],
+                    origin_stop_lat=float(o.get("lat", 0.0)),
+                    origin_stop_lon=float(o.get("lon", 0.0)),
                     destination_stop=t.get("destination_stop_name") or payload.destination_text,
                     total_minutes=total_minutes,
                     confidence="media" if realtime_service.positions else "baja",
@@ -487,6 +493,8 @@ def plan_route(payload: RoutePlanRequest):
                     route_id=t["trip_id"],
                     line=str(t["line"]),
                     origin_stop=o["name"],
+                    origin_stop_lat=float(o.get("lat", 0.0)),
+                    origin_stop_lon=float(o.get("lon", 0.0)),
                     destination_stop=t.get("destination_stop_name") or payload.destination_text,
                     total_minutes=total_minutes,
                     confidence="media" if realtime_service.positions else "baja",
