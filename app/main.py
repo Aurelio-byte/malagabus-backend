@@ -35,6 +35,7 @@ app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 IS_RENDER = os.environ.get("RENDER", "").lower() == "true"
 _data_load_lock = threading.Lock()
 MAX_SERVICE_AREA_DISTANCE_M = int(os.environ.get("MALAGABUS_MAX_SERVICE_DISTANCE_M", "2500"))
+_data_bootstrap_started = False
 
 
 class Preferences(BaseModel):
@@ -98,6 +99,7 @@ def startup_bootstrap():
     # En Render Free (512MB), cargar GTFS completo al arranque puede tumbar el proceso por memoria.
     # Lo evitamos en cloud y dejamos la carga bajo demanda mediante /v1/data/refresh.
     if IS_RENDER:
+        _start_background_data_bootstrap()
         return
     # Carga datos en arranque si no existe cache local.
     if not gtfs_service.stops:
@@ -119,6 +121,15 @@ def _ensure_data_ready() -> None:
     """
     if gtfs_service.stops:
         return
+    if IS_RENDER:
+        _start_background_data_bootstrap()
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "data_initializing",
+                "message": "Inicializando datos de transporte. Reintenta en 30-60 segundos.",
+            },
+        )
     with _data_load_lock:
         if gtfs_service.stops:
             return
@@ -139,6 +150,31 @@ def _ensure_data_ready() -> None:
                 realtime_service.refresh()
             except Exception:
                 pass
+
+
+def _background_refresh_job() -> None:
+    global _data_bootstrap_started
+    with _data_load_lock:
+        if gtfs_service.stops:
+            _data_bootstrap_started = True
+            return
+        try:
+            gtfs_service.refresh()
+        except Exception:
+            return
+        try:
+            realtime_service.refresh()
+        except Exception:
+            pass
+        _data_bootstrap_started = True
+
+
+def _start_background_data_bootstrap() -> None:
+    global _data_bootstrap_started
+    if _data_bootstrap_started:
+        return
+    _data_bootstrap_started = True
+    threading.Thread(target=_background_refresh_job, daemon=True).start()
 
 
 def _wait_eta_minutes(origin_stop_id: str, line: str) -> int:
