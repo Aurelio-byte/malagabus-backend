@@ -1,6 +1,7 @@
 import os
 import json
 import threading
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -36,6 +37,9 @@ IS_RENDER = os.environ.get("RENDER", "").lower() == "true"
 _data_load_lock = threading.Lock()
 MAX_SERVICE_AREA_DISTANCE_M = int(os.environ.get("MALAGABUS_MAX_SERVICE_DISTANCE_M", "2500"))
 _data_bootstrap_started = False
+DEBUG_LOG_PATH = r"d:\ARGUS\.cursor\debug.log"
+DEBUG_FALLBACK_LOG_PATH = r"d:\ARGUS\debug_fallback.log"
+DEBUG_BUILD = "dbg-20260304-1"
 
 
 class Preferences(BaseModel):
@@ -83,6 +87,35 @@ class RoutePlanResponse(BaseModel):
 _journey_state = {}
 
 
+def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: Optional[dict] = None) -> None:
+    payload = {
+        "id": f"log_{int(time.time() * 1000)}_{uuid4().hex[:6]}",
+        "timestamp": int(time.time() * 1000),
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data or {},
+    }
+    try:
+        os.makedirs(os.path.dirname(DEBUG_LOG_PATH), exist_ok=True)
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as e:
+        #region agent log
+        try:
+            with open(DEBUG_FALLBACK_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "timestamp": int(time.time() * 1000),
+                    "location": "app/main.py:_debug_log",
+                    "message": "primary_debug_log_write_failed",
+                    "data": {"error": str(e), "target": DEBUG_LOG_PATH},
+                }, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+        #endregion
+
+
 @app.get("/")
 def root():
     # El launcher abre la raíz del puerto: enviamos UI para usuario final.
@@ -91,11 +124,29 @@ def root():
 
 @app.get("/app")
 def app_home():
+    #region agent log
+    _debug_log(
+        run_id="baseline",
+        hypothesis_id="H6",
+        location="app/main.py:app_home",
+        message="app_home_served",
+        data={},
+    )
+    #endregion
     return FileResponse(str(WEB_DIR / "index.html"))
 
 
 @app.on_event("startup")
 def startup_bootstrap():
+    #region agent log
+    _debug_log(
+        run_id="baseline",
+        hypothesis_id="H7",
+        location="app/main.py:startup_bootstrap",
+        message="startup_bootstrap_called",
+        data={"is_render": IS_RENDER},
+    )
+    #endregion
     # En Render Free (512MB), cargar GTFS completo al arranque puede tumbar el proceso por memoria.
     # Lo evitamos en cloud y dejamos la carga bajo demanda mediante /v1/data/refresh.
     if IS_RENDER:
@@ -119,10 +170,28 @@ def _ensure_data_ready() -> None:
     Garantiza que GTFS esté cargado antes de planificar.
     En Render se carga bajo demanda para evitar picos de memoria en startup.
     """
+    #region agent log
+    _debug_log(
+        run_id="baseline",
+        hypothesis_id="H1",
+        location="app/main.py:_ensure_data_ready",
+        message="ensure_data_ready_enter",
+        data={"is_render": IS_RENDER, "gtfs_loaded": bool(gtfs_service.stops), "gtfs_stops": len(gtfs_service.stops)},
+    )
+    #endregion
     if gtfs_service.stops:
         return
     if IS_RENDER:
         _start_background_data_bootstrap()
+        #region agent log
+        _debug_log(
+            run_id="baseline",
+            hypothesis_id="H1",
+            location="app/main.py:_ensure_data_ready",
+            message="data_initializing_raised",
+            data={"is_render": IS_RENDER, "bootstrap_started": _data_bootstrap_started},
+        )
+        #endregion
         raise HTTPException(
             status_code=503,
             detail={
@@ -154,6 +223,15 @@ def _ensure_data_ready() -> None:
 
 def _background_refresh_job() -> None:
     global _data_bootstrap_started
+    #region agent log
+    _debug_log(
+        run_id="baseline",
+        hypothesis_id="H2",
+        location="app/main.py:_background_refresh_job",
+        message="background_refresh_start",
+        data={"gtfs_loaded_before": bool(gtfs_service.stops), "gtfs_stops_before": len(gtfs_service.stops)},
+    )
+    #endregion
     with _data_load_lock:
         if gtfs_service.stops:
             _data_bootstrap_started = True
@@ -161,12 +239,30 @@ def _background_refresh_job() -> None:
         try:
             gtfs_service.refresh()
         except Exception:
+            #region agent log
+            _debug_log(
+                run_id="baseline",
+                hypothesis_id="H2",
+                location="app/main.py:_background_refresh_job",
+                message="background_refresh_gtfs_failed",
+                data={},
+            )
+            #endregion
             return
         try:
             realtime_service.refresh()
         except Exception:
             pass
         _data_bootstrap_started = True
+        #region agent log
+        _debug_log(
+            run_id="baseline",
+            hypothesis_id="H2",
+            location="app/main.py:_background_refresh_job",
+            message="background_refresh_done",
+            data={"gtfs_stops_after": len(gtfs_service.stops), "realtime_positions_after": len(realtime_service.positions)},
+        )
+        #endregion
 
 
 def _start_background_data_bootstrap() -> None:
@@ -253,9 +349,23 @@ def _enrich_walk_to_origin(option: RouteOption, origin_lat: float, origin_lon: f
 
 @app.get("/v1/health")
 def health():
+    #region agent log
+    _debug_log(
+        run_id="baseline",
+        hypothesis_id="H6",
+        location="app/main.py:health",
+        message="health_called",
+        data={
+            "gtfs_loaded": len(gtfs_service.stops) > 0,
+            "gtfs_stops": len(gtfs_service.stops),
+            "realtime_positions": len(realtime_service.positions),
+        },
+    )
+    #endregion
     return {
         "status": "ok",
         "service": "malagabus-backend",
+        "debug_build": DEBUG_BUILD,
         "gtfs_loaded": len(gtfs_service.stops) > 0,
         "gtfs_stops": len(gtfs_service.stops),
         "realtime_positions": len(realtime_service.positions),
@@ -349,10 +459,36 @@ def eta_nearby(route_id: str, lat: float, lon: float):
 @app.post("/v1/route/plan", response_model=RoutePlanResponse)
 def plan_route(payload: RoutePlanRequest):
     _ensure_data_ready()
+    #region agent log
+    _debug_log(
+        run_id="baseline",
+        hypothesis_id="H3",
+        location="app/main.py:plan_route",
+        message="plan_route_enter",
+        data={
+            "destination_text": payload.destination_text,
+            "origin_lat": round(payload.origin_lat, 6),
+            "origin_lon": round(payload.origin_lon, 6),
+        },
+    )
+    #endregion
     if not payload.destination_text.strip():
         raise HTTPException(status_code=400, detail="destination_text es obligatorio")
 
     nearby_origin = gtfs_service.nearest_stops(payload.origin_lat, payload.origin_lon, limit=5)
+    #region agent log
+    _debug_log(
+        run_id="baseline",
+        hypothesis_id="H4",
+        location="app/main.py:plan_route",
+        message="nearest_stops_computed",
+        data={
+            "nearby_count": len(nearby_origin),
+            "nearest_distance_m": int(nearby_origin[0].get("distance_m", -1)) if nearby_origin else -1,
+            "nearest_name": nearby_origin[0].get("name", "") if nearby_origin else "",
+        },
+    )
+    #endregion
     if not nearby_origin:
         raise HTTPException(
             status_code=422,
@@ -363,6 +499,15 @@ def plan_route(payload: RoutePlanRequest):
         )
     nearest_distance_m = int(nearby_origin[0].get("distance_m", 999999))
     if nearest_distance_m > MAX_SERVICE_AREA_DISTANCE_M:
+        #region agent log
+        _debug_log(
+            run_id="baseline",
+            hypothesis_id="H4",
+            location="app/main.py:plan_route",
+            message="outside_service_area",
+            data={"nearest_distance_m": nearest_distance_m, "max_allowed_m": MAX_SERVICE_AREA_DISTANCE_M},
+        )
+        #endregion
         raise HTTPException(
             status_code=422,
             detail={
@@ -376,6 +521,15 @@ def plan_route(payload: RoutePlanRequest):
         )
 
     destination_matches = gtfs_service.search_stops(payload.destination_text, limit=8)
+    #region agent log
+    _debug_log(
+        run_id="baseline",
+        hypothesis_id="H8",
+        location="app/main.py:plan_route",
+        message="destination_matches_computed",
+        data={"destination_text": payload.destination_text, "matches_count": len(destination_matches)},
+    )
+    #endregion
 
     computed_options = []
     for o in nearby_origin[:3]:
@@ -439,7 +593,29 @@ def plan_route(payload: RoutePlanRequest):
         computed_options.sort(key=lambda x: x.total_minutes)
         top = computed_options[:3]
         top[0] = _enrich_walk_to_origin(top[0], payload.origin_lat, payload.origin_lon)
+        #region agent log
+        _debug_log(
+            run_id="baseline",
+            hypothesis_id="H5",
+            location="app/main.py:plan_route",
+            message="computed_options_return",
+            data={
+                "options_count": len(top),
+                "first_line": top[0].line if top else "",
+                "first_total_min": top[0].total_minutes if top else None,
+            },
+        )
+        #endregion
         return RoutePlanResponse(recommended_route_id=top[0].route_id, route_options=top)
+    #region agent log
+    _debug_log(
+        run_id="baseline",
+        hypothesis_id="H8",
+        location="app/main.py:plan_route",
+        message="computed_options_empty",
+        data={"destination_text": payload.destination_text},
+    )
+    #endregion
 
     # Segundo intento: buscar destino por texto en paradas aguas abajo del origen.
     for o in nearby_origin[:4]:
@@ -511,11 +687,46 @@ def plan_route(payload: RoutePlanRequest):
                 recommended_route_id=smart_options[0].route_id,
                 route_options=smart_options[:3],
             )
+    #region agent log
+    _debug_log(
+        run_id="baseline",
+        hypothesis_id="H9",
+        location="app/main.py:plan_route",
+        message="smart_options_empty",
+        data={"destination_text": payload.destination_text},
+    )
+    #endregion
 
     # Tercer intento: viaje real desde origen aunque el destino no case perfecto.
     preferred_ids = [d["stop_id"] for d in destination_matches]
     for o in nearby_origin[:3]:
+        if not preferred_ids:
+            #region agent log
+            _debug_log(
+                run_id="post-fix",
+                hypothesis_id="H10",
+                location="app/main.py:plan_route",
+                message="skip_basic_trip_no_destination_matches",
+                data={"origin_stop": o.get("name", ""), "destination_text": payload.destination_text},
+            )
+            #endregion
+            continue
         basic = gtfs_service.suggest_basic_trip(o["stop_id"], preferred_stop_ids=preferred_ids, limit=2)
+        basic = [b for b in basic if b.get("is_preferred_destination")]
+        #region agent log
+        _debug_log(
+            run_id="post-fix",
+            hypothesis_id="H10",
+            location="app/main.py:plan_route",
+            message="basic_trip_probe",
+            data={
+                "origin_stop": o.get("name", ""),
+                "destination_text": payload.destination_text,
+                "preferred_ids_count": len(preferred_ids),
+                "basic_count": len(basic),
+            },
+        )
+        #endregion
         if not basic:
             continue
         real_options = []
@@ -575,12 +786,35 @@ def plan_route(payload: RoutePlanRequest):
         if real_options:
             real_options.sort(key=lambda x: x.total_minutes)
             real_options[0] = _enrich_walk_to_origin(real_options[0], payload.origin_lat, payload.origin_lon)
+            #region agent log
+            _debug_log(
+                run_id="post-fix",
+                hypothesis_id="H10",
+                location="app/main.py:plan_route",
+                message="returning_basic_trip_fallback",
+                data={
+                    "destination_text": payload.destination_text,
+                    "line": real_options[0].line,
+                    "origin_stop": real_options[0].origin_stop,
+                    "destination_stop": real_options[0].destination_stop,
+                },
+            )
+            #endregion
             return RoutePlanResponse(
                 recommended_route_id=real_options[0].route_id,
                 route_options=real_options[:3],
             )
 
     # Sin fallback "inventado": devolver vacío para que UI lo comunique correctamente.
+    #region agent log
+    _debug_log(
+        run_id="baseline",
+        hypothesis_id="H5",
+        location="app/main.py:plan_route",
+        message="no_route_options_returned",
+        data={"destination_text": payload.destination_text},
+    )
+    #endregion
     return RoutePlanResponse(recommended_route_id="", route_options=[])
 
 

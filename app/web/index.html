@@ -126,6 +126,12 @@
     crossorigin=""
   ></script>
   <script>
+    // #region agent log
+    function dbg(hypothesisId, message, data) {
+      fetch('http://127.0.0.1:7242/ingest/bfe8e410-8672-4ba7-984a-0cbaf0716f46',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId:'baseline-ui',hypothesisId,location:'app/web/index.html',message,data:data||{},timestamp:Date.now()})}).catch(()=>{});
+    }
+    // #endregion
+
     const statusEl = document.getElementById("status");
     const resultEl = document.getElementById("resultado");
     const resumenEl = document.getElementById("resumen");
@@ -160,14 +166,37 @@
     }
 
     async function getOrigin() {
+      // #region agent log
+      dbg("H1", "getOrigin_enter", { geolocationAvailable: !!navigator.geolocation });
+      // #endregion
       return await new Promise((resolve) => {
         if (!navigator.geolocation) {
+          // #region agent log
+          dbg("H1", "getOrigin_no_geolocation_fallback", { lat: 36.7213, lon: -4.4214 });
+          // #endregion
           resolve({ lat: 36.7213, lon: -4.4214 });
           return;
         }
+        if (navigator.permissions && navigator.permissions.query) {
+          navigator.permissions.query({ name: "geolocation" }).then((p) => {
+            // #region agent log
+            dbg("H2", "geolocation_permission_state", { state: p.state });
+            // #endregion
+          }).catch(() => {});
+        }
         navigator.geolocation.getCurrentPosition(
-          (p) => resolve({ lat: p.coords.latitude, lon: p.coords.longitude }),
-          () => resolve({ lat: 36.7213, lon: -4.4214 }),
+          (p) => {
+            // #region agent log
+            dbg("H3", "getOrigin_success", { lat: p.coords.latitude, lon: p.coords.longitude, accuracy: p.coords.accuracy });
+            // #endregion
+            resolve({ lat: p.coords.latitude, lon: p.coords.longitude });
+          },
+          (err) => {
+            // #region agent log
+            dbg("H4", "getOrigin_error_fallback", { code: err && err.code, message: err && err.message, lat: 36.7213, lon: -4.4214 });
+            // #endregion
+            resolve({ lat: 36.7213, lon: -4.4214 });
+          },
           { timeout: 4000, enableHighAccuracy: true }
         );
       });
@@ -253,6 +282,9 @@
       setStatus("Calculando mejor ruta...");
       try {
         const origin = await getOrigin();
+        // #region agent log
+        dbg("H5", "planRoute_origin_used", { lat: origin.lat, lon: origin.lon, destinationText });
+        // #endregion
         const r = await fetch("/v1/route/plan", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
