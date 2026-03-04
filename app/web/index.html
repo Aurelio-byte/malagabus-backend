@@ -148,17 +148,57 @@
     let journeyId = null;
     let routeMap = null;
     let navTarget = null;
+    let _hasLoadedOnce = false;
 
     function setStatus(msg, type = "") {
       statusEl.textContent = msg;
       statusEl.className = "status " + type;
     }
 
+    function resetAppState(reason) {
+      selectedRouteId = null;
+      journeyId = null;
+      navTarget = null;
+      destinoEl.value = "";
+      resumenEl.textContent = "";
+      pasosEl.innerHTML = "";
+      guiaEl.textContent = "";
+      guiaEl.className = "status";
+      btnSiguiente.disabled = true;
+      btnNav.classList.add("hidden");
+      mapEl.classList.add("hidden");
+      resultEl.classList.add("hidden");
+      setStatus("Servicio listo. Escribe destino para empezar.", "ok");
+      // #region agent log
+      sendClientDebug("H17", "state_reset_on_open", { reason: reason || "unknown" });
+      // #endregion
+    }
+
+    // #region agent log
+    async function sendClientDebug(hypothesisId, message, data) {
+      try {
+        await fetch("/v1/debug/client-event", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            run_id: "baseline-ui",
+            hypothesis_id: hypothesisId,
+            message,
+            data: data || {},
+          }),
+        });
+      } catch (_) {}
+    }
+    // #endregion
+
     async function checkHealth() {
       try {
         const r = await fetch("/v1/health");
         if (!r.ok) throw new Error("backend_down");
         const d = await r.json();
+        // #region agent log
+        sendClientDebug("H11", "health_loaded", { debug_build: d.debug_build || null, gtfs_loaded: !!d.gtfs_loaded });
+        // #endregion
         setStatus("Servicio listo. " + (d.gtfs_loaded ? "Datos cargados." : "Cargando datos..."), "ok");
       } catch (_) {
         setStatus("No se pudo conectar al servicio.", "error");
@@ -387,6 +427,36 @@
     destinoEl.addEventListener("keydown", (e) => {
       if (e.key === "Enter") planRoute();
     });
+
+    // #region agent log
+    const navEntry = performance.getEntriesByType("navigation");
+    const navType = navEntry && navEntry.length ? navEntry[0].type : "unknown";
+    const launchCount = Number(localStorage.getItem("mb_launch_count") || "0") + 1;
+    localStorage.setItem("mb_launch_count", String(launchCount));
+    sendClientDebug("H12", "app_boot", {
+      nav_type: navType,
+      launch_count: launchCount,
+      referrer: document.referrer || "",
+      visibility: document.visibilityState || "",
+      standalone: window.matchMedia && window.matchMedia("(display-mode: standalone)").matches,
+    });
+    resetAppState("boot");
+    _hasLoadedOnce = true;
+    window.addEventListener("pageshow", (ev) => {
+      sendClientDebug("H12", "pageshow", { persisted: !!ev.persisted, visibility: document.visibilityState || "" });
+      if (_hasLoadedOnce) {
+        resetAppState(ev.persisted ? "pageshow_persisted" : "pageshow");
+      }
+    });
+    let _wasHidden = document.visibilityState === "hidden";
+    document.addEventListener("visibilitychange", () => {
+      sendClientDebug("H13", "visibility_change", { visibility: document.visibilityState || "" });
+      if (_wasHidden && document.visibilityState === "visible") {
+        resetAppState("resume_visible");
+      }
+      _wasHidden = document.visibilityState === "hidden";
+    });
+    // #endregion
 
     checkHealth();
   </script>

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -39,7 +39,8 @@ MAX_SERVICE_AREA_DISTANCE_M = int(os.environ.get("MALAGABUS_MAX_SERVICE_DISTANCE
 _data_bootstrap_started = False
 DEBUG_LOG_PATH = r"d:\ARGUS\.cursor\debug.log"
 DEBUG_FALLBACK_LOG_PATH = r"d:\ARGUS\debug_fallback.log"
-DEBUG_BUILD = "dbg-20260304-1"
+DEBUG_BUILD = "dbg-20260304-2"
+_client_debug_events: List[dict] = []
 
 
 class Preferences(BaseModel):
@@ -84,6 +85,13 @@ class RoutePlanResponse(BaseModel):
     route_options: List[RouteOption]
 
 
+class ClientDebugEvent(BaseModel):
+    run_id: str = "baseline-ui"
+    hypothesis_id: str = "H11"
+    message: str = "client_event"
+    data: dict = {}
+
+
 _journey_state = {}
 
 
@@ -114,6 +122,27 @@ def _debug_log(run_id: str, hypothesis_id: str, location: str, message: str, dat
         except Exception:
             pass
         #endregion
+
+
+@app.middleware("http")
+async def _debug_http_middleware(request: Request, call_next):
+    #region agent log
+    _debug_log(
+        run_id="baseline-http",
+        hypothesis_id="H16",
+        location="app/main.py:_debug_http_middleware",
+        message="http_request_in",
+        data={
+            "method": request.method,
+            "path": request.url.path,
+            "query": request.url.query,
+            "host": request.headers.get("host", ""),
+            "ua": request.headers.get("user-agent", "")[:120],
+        },
+    )
+    #endregion
+    response = await call_next(request)
+    return response
 
 
 @app.get("/")
@@ -369,6 +398,44 @@ def health():
         "gtfs_loaded": len(gtfs_service.stops) > 0,
         "gtfs_stops": len(gtfs_service.stops),
         "realtime_positions": len(realtime_service.positions),
+    }
+
+
+@app.post("/v1/debug/client-event")
+async def debug_client_event(payload: ClientDebugEvent, request: Request):
+    evt = {
+        "ts": int(time.time() * 1000),
+        "run_id": payload.run_id,
+        "hypothesis_id": payload.hypothesis_id,
+        "message": payload.message,
+        "data": payload.data or {},
+        "ua": request.headers.get("user-agent", "")[:220],
+    }
+    _client_debug_events.append(evt)
+    if len(_client_debug_events) > 200:
+        del _client_debug_events[:-200]
+    #region agent log
+    _debug_log(
+        run_id=payload.run_id,
+        hypothesis_id=payload.hypothesis_id,
+        location="app/main.py:debug_client_event",
+        message=payload.message,
+        data={
+            "ua": request.headers.get("user-agent", "")[:220],
+            "data": payload.data,
+        },
+    )
+    #endregion
+    return {"ok": True}
+
+
+@app.get("/v1/debug/events")
+def debug_events(limit: int = 60):
+    lim = max(1, min(int(limit), 200))
+    return {
+        "debug_build": DEBUG_BUILD,
+        "count": len(_client_debug_events),
+        "events": _client_debug_events[-lim:],
     }
 
 
